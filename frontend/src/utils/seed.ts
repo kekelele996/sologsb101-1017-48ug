@@ -91,10 +91,12 @@ export async function seedDatabase(): Promise<void> {
   ]
 
   // ---------------- 出炉检验（2–3 条，含不合格与返工后复检合格） ----------------
+  // 检验室那份单子：结论 + 缺陷 + 返工退回哪道工序（reworkStepSeq 按作品 + 道次序号对账）。
+  // inspect-g1 的裂纹退回第 3 道「塑形」；该道次已重新完成，派生返工状态为「已完成」。
   const inspects: Inspect[] = [
-    wrap<Inspect>({ id: 'inspect-b1', pieceId: SEED_IDS.pieceBottle, result: '合格', defectNote: '', inspector: '吴岚', date: '2026-09-28' }),
-    wrap<Inspect>({ id: 'inspect-g1', pieceId: SEED_IDS.pieceGreen, result: '裂纹', defectNote: '口沿下方 12 mm 处有细裂纹，需回炉修补；原始工序记录保留不变。', inspector: '吴岚', date: '2026-09-22' }),
-    wrap<Inspect>({ id: 'inspect-g2', pieceId: SEED_IDS.pieceGreen, result: '合格', defectNote: '回炉修补后复检合格。', inspector: '吴岚', date: '2026-09-25' }),
+    wrap<Inspect>({ id: 'inspect-b1', pieceId: SEED_IDS.pieceBottle, result: '合格', defectNote: '', inspector: '吴岚', date: '2026-09-28', reworkStepSeq: null, legacyReadonly: false }),
+    wrap<Inspect>({ id: 'inspect-g1', pieceId: SEED_IDS.pieceGreen, result: '裂纹', defectNote: '口沿下方 12 mm 处有细裂纹，需回炉修补；原始工序记录保留不变。', inspector: '吴岚', date: '2026-09-22', reworkStepSeq: 3, legacyReadonly: false }),
+    wrap<Inspect>({ id: 'inspect-g2', pieceId: SEED_IDS.pieceGreen, result: '合格', defectNote: '回炉修补后复检合格。', inspector: '吴岚', date: '2026-09-25', reworkStepSeq: null, legacyReadonly: false }),
   ]
 
   await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects], async () => {

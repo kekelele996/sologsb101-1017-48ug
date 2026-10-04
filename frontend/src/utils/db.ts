@@ -12,6 +12,7 @@ import type { Piece, PieceState } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
+import { parseReworkSeqFromNote } from '../types/inspect'
 import { nowIso } from './id'
 import { seedDatabase } from './seed'
 
@@ -19,10 +20,10 @@ import { seedDatabase } from './seed'
 export const DB_NAME = 'gbglassblow'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 class GlassBlowDatabase extends Dexie {
   furnaces!: Table<Furnace, string>
@@ -46,7 +47,7 @@ class GlassBlowDatabase extends Dexie {
     })
 
     // ---------- v2：Piece 增加 craft 索引并回填默认值，补齐其余索引与字段 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
         batches: 'id, furnaceId, colorCode, meltDate, remainKg',
@@ -92,6 +93,44 @@ class GlassBlowDatabase extends Dexie {
         await tx.table('inspects').toCollection().modify((row: Record<string, unknown>) => {
           if (typeof row.defectNote !== 'string') row.defectNote = ''
         })
+      })
+
+    // ---------- v3：检验记录拆分返工道次，老记录留只读 ----------
+    this.version(3)
+      .stores({
+        furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
+        batches: 'id, furnaceId, colorCode, meltDate, remainKg',
+        pieces: 'id, batchId, state, artist, craft, name',
+        steps: 'id, pieceId, [pieceId+seq], seq, state, name',
+        anneals: 'id, pieceId, kilnSlot, state, inAt, curveSeg',
+        inspects: 'id, pieceId, date, result, inspector, reworkStepSeq, legacyReadonly',
+      })
+      .upgrade(async (tx) => {
+        // 迁移 6：检验记录补齐返工道次与只读标记
+        // 旧数据里返工只记在作品（缺陷说明）上，升级时按当时的道次顺序拆到具体道次；
+        // 对不上的老记录保留原样、标记只读，不可改派。
+        const inspectRows = await tx.table('inspects').toArray()
+        const stepsCache = new Map<string, Step[]>()
+        for (const row of inspectRows) {
+          const r = row as Inspect
+          if (typeof r.reworkStepSeq !== 'number') r.reworkStepSeq = null
+          if (typeof r.legacyReadonly !== 'boolean') r.legacyReadonly = false
+          if (r.result !== '合格' && r.reworkStepSeq === null && !r.legacyReadonly) {
+            let pieceSteps = stepsCache.get(r.pieceId)
+            if (pieceSteps === undefined) {
+              pieceSteps = (await tx.table('steps').where('pieceId').equals(r.pieceId).toArray()) as Step[]
+              stepsCache.set(r.pieceId, pieceSteps)
+            }
+            const seq = parseReworkSeqFromNote(r.defectNote, pieceSteps)
+            if (seq !== null && pieceSteps.some((s) => s.seq === seq)) {
+              r.reworkStepSeq = seq
+            } else {
+              // 拆不到具体道次：留着只读
+              r.legacyReadonly = true
+            }
+          }
+          await tx.table('inspects').put(r)
+        }
       })
   }
 }
@@ -240,6 +279,23 @@ export async function reorderSteps(orderedIds: string[]): Promise<void> {
   })
 }
 
+/**
+ * 工序台按检验室指定的道次返工：只重开被点中的那一道工序。
+ * - 按「作品 + 道次序号」对账，找不到该道次时返回 null（检验室那笔已挂起，等确认）。
+ * - 只把目标道次从「已完成」退回「进行中」；前面已确认的工序记录原样保留、不抹掉。
+ * - 纯工序侧写操作（steps + 作品状态），不碰检验记录；调用方应包一层 withRetry，
+ *   失败只重试本侧，检验室那份不动。
+ */
+export async function reworkStep(pieceId: string, seq: number): Promise<Step | null> {
+  const target = await db.steps.where('[pieceId+seq]').equals([pieceId, seq]).first()
+  if (target === undefined) return null
+  if (target.state === '已完成') {
+    await db.steps.update(target.id, { state: '进行中', updatedAt: nowIso() })
+  }
+  await syncPieceState(pieceId)
+  return target
+}
+
 /* -------------------------------- 退火 -------------------------------- */
 
 export async function listAnneals(): Promise<Anneal[]> {
@@ -336,7 +392,18 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.pieces.bulkPut(snapshot.pieces.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.steps.bulkPut(snapshot.steps.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.anneals.bulkPut(snapshot.anneals.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.inspects.bulkPut(snapshot.inspects.map((row) => ({ ...row, revision: ROW_REVISION })))
+    await db.inspects.bulkPut(
+      snapshot.inspects.map((row) => {
+        const normalized = { ...row, revision: ROW_REVISION } as Inspect
+        if (typeof normalized.reworkStepSeq !== 'number') normalized.reworkStepSeq = null
+        if (typeof normalized.legacyReadonly !== 'boolean') normalized.legacyReadonly = false
+        // 不合格且未指定返工道次的老存档记录：保留原样、只读
+        if (normalized.result !== '合格' && normalized.reworkStepSeq === null) {
+          normalized.legacyReadonly = true
+        }
+        return normalized
+      }),
+    )
   })
 }
 

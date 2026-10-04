@@ -17,7 +17,17 @@ import { usePieceStore } from '@/stores/pieceStore'
 import { DB_NAME, DB_SCHEMA_VERSION, db, exportSnapshot, importSnapshot, resetDatabase } from '@/utils/db'
 import { exportScheduleCsvFile, exportSnapshotJson, parseSnapshot } from '@/utils/export'
 import { useIdbTable } from '@/hooks/useIdbTable'
-import { INSPECT_RESULT_OPTIONS, type Inspect, type InspectDraft, type InspectResult } from '@/types/inspect'
+import {
+  INSPECT_RESULT_OPTIONS,
+  deriveReworkStatus,
+  findReworkTarget,
+  reworkStatusTagType,
+  type Inspect,
+  type InspectDraft,
+  type InspectResult,
+  type ReworkStatus,
+} from '@/types/inspect'
+import type { Step } from '@/types/step'
 import { today } from '@/utils/id'
 
 const router = useRouter()
@@ -40,7 +50,27 @@ const form = reactive<InspectDraft>({
   defectNote: '',
   inspector: '',
   date: today(),
+  reworkStepSeq: null,
 })
+
+/** 选中作品的吹制工序列表（供检验室指定返工退回哪道工序） */
+const reworkTargetOptions = computed<Step[]>(() => pieceStore.stepsOf(form.pieceId))
+
+/** 某条检验记录的返工对账状态（由检验记录 + 工序记录按作品 + 道次序号派生） */
+function reworkStatusOf(row: Inspect): ReworkStatus {
+  return deriveReworkStatus(
+    row,
+    pieceStore.steps.filter((s) => s.pieceId === row.pieceId),
+  )
+}
+
+/** 某条检验记录返工指向的具体工序（对不上为 null） */
+function reworkTargetOf(row: Inspect): Step | null {
+  return findReworkTarget(
+    row,
+    pieceStore.steps.filter((s) => s.pieceId === row.pieceId),
+  )
+}
 
 const rules = computed<FormRules<InspectDraft>>(() => ({
   pieceId: [{ required: true, message: '请选择作品', trigger: 'change' }],
@@ -49,6 +79,26 @@ const rules = computed<FormRules<InspectDraft>>(() => ({
   date: [{ required: true, message: '请选择检验日期', trigger: 'change' }],
   defectNote:
     form.result === '合格' ? [] : [{ required: true, message: '判定不合格时必须填写缺陷说明', trigger: 'blur' }],
+  reworkStepSeq:
+    form.result === '合格'
+      ? []
+      : [
+          {
+            required: true,
+            validator: (_rule, value: number | null, callback) => {
+              if (form.result === '合格') return callback()
+              if (reworkTargetOptions.value.length === 0) return callback()
+              if (value === null || value === undefined) {
+                return callback(new Error('判定不合格时必须指定返工退回哪道工序'))
+              }
+              if (!reworkTargetOptions.value.some((s) => s.seq === value)) {
+                return callback(new Error('指定的道次对不上当前工序，请重新选择'))
+              }
+              callback()
+            },
+            trigger: 'change',
+          },
+        ],
 }))
 
 const pieceLabel = computed<Record<string, string>>(() =>
@@ -98,11 +148,16 @@ function openCreate(): void {
     defectNote: '',
     inspector: '',
     date: today(),
+    reworkStepSeq: null,
   })
   dialogVisible.value = true
 }
 
 function openEdit(row: Inspect): void {
+  if (row.legacyReadonly) {
+    ElMessage.info('这是升级前的老返工记录，只记在作品上、拆不到具体道次，按要求保留只读，不可编辑')
+    return
+  }
   editingId.value = row.id
   Object.assign(form, {
     pieceId: row.pieceId,
@@ -110,8 +165,25 @@ function openEdit(row: Inspect): void {
     defectNote: row.defectNote,
     inspector: row.inspector,
     date: row.date,
+    reworkStepSeq: row.reworkStepSeq,
   })
   dialogVisible.value = true
+}
+
+/** 检验结果切到「合格」时清空返工道次；切到不合格时默认选中当前第一道 */
+function onResultChange(): void {
+  if (form.result === '合格') {
+    form.reworkStepSeq = null
+  } else if (form.reworkStepSeq === null && reworkTargetOptions.value.length > 0) {
+    form.reworkStepSeq = reworkTargetOptions.value[0].seq
+  }
+}
+
+/** 作品切换时，若已选返工道次不属于该作品则清空 */
+function onPieceChange(): void {
+  if (form.reworkStepSeq !== null && !reworkTargetOptions.value.some((s) => s.seq === form.reworkStepSeq)) {
+    form.reworkStepSeq = reworkTargetOptions.value.length > 0 ? reworkTargetOptions.value[0].seq : null
+  }
 }
 
 async function handleSubmit(): Promise<void> {
@@ -121,15 +193,23 @@ async function handleSubmit(): Promise<void> {
   submitting.value = true
   try {
     if (editingId.value === null) {
-      await create({ ...form }, 'inspect')
+      await create({ ...form, legacyReadonly: false }, 'inspect')
       ElMessage.success(
         form.result === '合格'
           ? '检验已登记：合格'
-          : `检验已登记：${form.result}，已生成返工提示（原始工序记录保留不变）`,
+          : `检验已登记：${form.result}，返工提示已生成（原始工序记录保留不变）`,
       )
     } else {
       await update(editingId.value, { ...form })
       ElMessage.success('检验记录已更新')
+    }
+    // 检验室这份写完后，再通知工序台按「作品 + 道次序号」退回指定道次。
+    // 工序台保存失败只重试本侧（pieceStore.reworkStep 内部 withRetry），检验室那份不动。
+    if (form.result !== '合格' && form.reworkStepSeq !== null) {
+      const target = await pieceStore.reworkStep(form.pieceId, form.reworkStepSeq)
+      if (target === null) {
+        ElMessage.warning('指定的返工道次对不上当前工序，该笔返工已挂起，请确认退回道次')
+      }
     }
     dialogVisible.value = false
   } finally {
@@ -149,6 +229,51 @@ async function handleDelete(row: Inspect): Promise<void> {
   }
   await remove(row.id)
   ElMessage.success('检验记录已删除')
+}
+
+/* ------------------------- 挂起返工的确认 / 取消 ------------------------- */
+
+const retargetVisible = ref(false)
+const retargetRow = ref<Inspect | null>(null)
+const retargetSeq = ref<number | null>(null)
+const retargetOptions = computed<Step[]>(() =>
+  retargetRow.value === null ? [] : pieceStore.stepsOf(retargetRow.value.pieceId),
+)
+
+function openRetarget(row: Inspect): void {
+  retargetRow.value = row
+  retargetSeq.value = row.reworkStepSeq
+  retargetVisible.value = true
+}
+
+async function confirmRetarget(): Promise<void> {
+  if (retargetRow.value === null) return
+  if (retargetSeq.value === null) {
+    ElMessage.warning('请选择要退回的道次')
+    return
+  }
+  await update(retargetRow.value.id, { reworkStepSeq: retargetSeq.value })
+  ElMessage.success('已重新确认返工道次')
+  // 通知工序台按新道次返工（工序侧重试，检验室那份不动）
+  const target = await pieceStore.reworkStep(retargetRow.value.pieceId, retargetSeq.value)
+  if (target === null) {
+    ElMessage.warning('该道次仍对不上当前工序，返工继续挂起')
+  }
+  retargetVisible.value = false
+}
+
+async function handleCancelRework(row: Inspect): Promise<void> {
+  try {
+    await ElMessageBox.confirm(`确认取消 ${row.date} 检验的返工？取消后该笔不再退回任何工序。`, '取消返工确认', {
+      type: 'warning',
+      confirmButtonText: '取消返工',
+      cancelButtonText: '返回',
+    })
+  } catch {
+    return
+  }
+  await update(row.id, { reworkStepSeq: null })
+  ElMessage.success('已取消返工')
 }
 
 async function handleExportJson(): Promise<void> {
@@ -231,13 +356,27 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
       show-icon
       :closable="false"
       class="mb-14"
-      :title="`有 ${defectRows.length} 条检验记录判定不合格，已生成返工提示`"
+      :title="`有 ${defectRows.length} 条检验记录判定不合格，返工已按「作品 + 道次序号」退回指定工序`"
     >
       <template #default>
         <div class="defect-list">
-          <div v-for="row in defectRows" :key="row.id">
-            {{ pieceLabel[row.pieceId] ?? '（作品已删除）' }} · {{ row.date }} · {{ row.result }}：
-            {{ row.defectNote }} —— 原始工序记录保留，可在工序页重新推进状态后再次入窑退火。
+          <div v-for="row in defectRows" :key="row.id" class="defect-row">
+            <el-tag size="small" :type="reworkStatusTagType(reworkStatusOf(row))" effect="dark">
+              {{ reworkStatusOf(row) }}
+            </el-tag>
+            <span>
+              {{ pieceLabel[row.pieceId] ?? '（作品已删除）' }} · {{ row.date }} · {{ row.result }}：
+              {{ row.defectNote }}
+              <template v-if="reworkTargetOf(row) !== null">
+                —— 退回第 {{ reworkTargetOf(row)?.seq }} 道「{{ reworkTargetOf(row)?.name }}」返工，前面已确认的工序记录保留不变。
+              </template>
+              <template v-else-if="reworkStatusOf(row) === '已挂起'">
+                —— 指定的返工道次对不上当前工序，已挂起等确认。
+              </template>
+              <template v-else-if="reworkStatusOf(row) === '只读'">
+                —— 升级前的老返工记录，只记在作品上、拆不到具体道次，保留只读。
+              </template>
+            </span>
           </div>
         </div>
       </template>
@@ -289,7 +428,7 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
       <EmptyPanel
         v-if="rows.length === 0 && !loading"
         title="还没有出炉检验记录"
-        description="作品退火出炉后登记检验结果；判定为裂纹 / 气泡 / 变形时会生成返工提示，同时保留原始工序记录用于追溯。"
+        description="作品退火出炉后登记检验结论与缺陷说明；判定为裂纹 / 气泡 / 变形时指定返工退回哪道工序，按「作品 + 道次序号」对账，前面已确认的工序记录保留不抹掉。"
         action-text="登记第一条检验"
         @action="openCreate"
       />
@@ -320,17 +459,45 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="缺陷说明 / 返工提示" min-width="300">
+        <el-table-column label="返工道次" width="150">
+          <template #default="{ row }">
+            <template v-if="row.result === '合格'">
+              <span class="cell-sub">—</span>
+            </template>
+            <template v-else>
+              <div class="cell-stack">
+                <el-tag size="small" :type="reworkStatusTagType(reworkStatusOf(row))" effect="dark">
+                  {{ reworkStatusOf(row) }}
+                </el-tag>
+                <span v-if="reworkTargetOf(row) !== null" class="cell-sub">
+                  退回第 {{ reworkTargetOf(row)?.seq }} 道「{{ reworkTargetOf(row)?.name }}」
+                </span>
+                <span v-else-if="reworkStatusOf(row) === '已挂起'" class="cell-warn"> 道次对不上，待确认 </span>
+                <span v-else-if="reworkStatusOf(row) === '只读'" class="cell-sub"> 老记录只读 </span>
+              </div>
+            </template>
+          </template>
+        </el-table-column>
+        <el-table-column label="缺陷说明" min-width="260">
           <template #default="{ row }">
             <span v-if="row.defectNote === ''" class="cell-sub">无缺陷</span>
             <span v-else :class="{ 'cell-warn': row.result !== '合格' }">{{ row.defectNote }}</span>
           </template>
         </el-table-column>
         <el-table-column prop="inspector" label="检验人" width="110" />
-        <el-table-column label="操作" width="150" fixed="right">
+        <el-table-column label="操作" width="210" fixed="right">
           <template #default="{ row }">
-            <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
-            <el-button link type="danger" size="small" @click="handleDelete(row)">删除</el-button>
+            <template v-if="row.legacyReadonly">
+              <el-tag size="small" type="info" effect="plain">只读</el-tag>
+            </template>
+            <template v-else-if="reworkStatusOf(row) === '已挂起'">
+              <el-button link type="warning" size="small" @click="openRetarget(row)">确认道次</el-button>
+              <el-button link type="info" size="small" @click="handleCancelRework(row)">取消返工</el-button>
+            </template>
+            <template v-else>
+              <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
+              <el-button link type="danger" size="small" @click="handleDelete(row)">删除</el-button>
+            </template>
           </template>
         </el-table-column>
       </el-table>
@@ -339,7 +506,7 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
     <el-dialog v-model="dialogVisible" :title="editingId === null ? '登记出炉检验' : '编辑出炉检验'" width="620px">
       <el-form ref="formRef" :model="form" :rules="rules" label-width="120px">
         <el-form-item label="作品" prop="pieceId">
-          <el-select v-model="form.pieceId" filterable style="width: 100%">
+          <el-select v-model="form.pieceId" filterable style="width: 100%" @change="onPieceChange">
             <el-option
               v-for="item in pieceStore.pieces"
               :key="item.id"
@@ -351,7 +518,7 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
         <el-row :gutter="12">
           <el-col :span="8">
             <el-form-item label="检验结果" prop="result">
-              <el-select v-model="form.result" style="width: 100%">
+              <el-select v-model="form.result" style="width: 100%" @change="onResultChange">
                 <el-option v-for="item in INSPECT_RESULT_OPTIONS" :key="item" :value="item" :label="item" />
               </el-select>
             </el-form-item>
@@ -367,6 +534,29 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
             </el-form-item>
           </el-col>
         </el-row>
+        <el-form-item
+          v-if="form.result !== '合格'"
+          label="返工道次"
+          prop="reworkStepSeq"
+        >
+          <el-select
+            v-model="form.reworkStepSeq"
+            filterable
+            placeholder="选择返工退回哪道工序"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="step in reworkTargetOptions"
+              :key="step.id"
+              :value="step.seq"
+              :label="`第 ${step.seq} 道 · ${step.name} · ${step.state}`"
+            />
+          </el-select>
+          <div class="form-hint">
+            按「作品 + 道次序号」退回到具体那道工序；前面已确认的工序记录保留不抹掉。
+            <template v-if="reworkTargetOptions.length === 0">该作品还没有工序，无法指定返工道次。</template>
+          </div>
+        </el-form-item>
         <el-form-item label="缺陷说明" prop="defectNote">
           <el-input
             v-model="form.defectNote"
@@ -381,7 +571,7 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
           show-icon
           :closable="false"
           :title="`判定为「${form.result}」将生成返工提示`"
-          description="原始吹制工序记录会完整保留，返工后可在工序页重新推进状态并再次入窑退火。"
+          description="返工只退回被点中的那道工序，前面已确认的工序记录完整保留；工序台保存失败只重试工序侧，检验室这份不动。"
         />
         <el-alert
           v-else
@@ -395,6 +585,37 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="submitting" @click="handleSubmit">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="retargetVisible" title="确认返工退回的道次" width="480px">
+      <el-form label-width="110px">
+        <el-form-item label="作品">
+          <span>{{ retargetRow === null ? '' : pieceLabel[retargetRow.pieceId] ?? '（作品已删除）' }}</span>
+        </el-form-item>
+        <el-form-item label="检验结果">
+          <el-tag size="small" :type="retargetRow === null ? 'info' : reworkStatusTagType(reworkStatusOf(retargetRow))">
+            {{ retargetRow === null ? '' : reworkStatusOf(retargetRow) }}
+          </el-tag>
+          <span class="cell-sub" style="margin-left: 8px">
+            {{ retargetRow?.date }} · {{ retargetRow?.result }}
+          </span>
+        </el-form-item>
+        <el-form-item label="退回道次" required>
+          <el-select v-model="retargetSeq" filterable placeholder="选择返工退回哪道工序" style="width: 100%">
+            <el-option
+              v-for="step in retargetOptions"
+              :key="step.id"
+              :value="step.seq"
+              :label="`第 ${step.seq} 道 · ${step.name} · ${step.state}`"
+            />
+          </el-select>
+          <div class="form-hint">按「作品 + 道次序号」重新对账；对不上的道次会继续挂起等确认。</div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="retargetVisible = false">取消</el-button>
+        <el-button type="primary" @click="confirmRetarget">确认道次</el-button>
       </template>
     </el-dialog>
   </div>
@@ -440,9 +661,22 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
 .defect-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 6px;
   font-size: 12px;
   line-height: 1.8;
+}
+
+.defect-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.form-hint {
+  font-size: 12px;
+  color: #8b95a1;
+  line-height: 1.6;
+  margin-top: 4px;
 }
 
 .mb-14 {

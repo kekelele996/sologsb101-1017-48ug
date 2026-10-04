@@ -55,6 +55,19 @@ const rules: FormRules<StepDraft> = {
 
 const steps = computed<Step[]>(() => pieceStore.stepsOf(pieceId.value))
 
+/** 检验室退回的返工对账（按作品 + 道次序号） */
+const reworks = computed(() => pieceStore.reworksOf(pieceId.value))
+/** 待返工：检验室已退回、该道次尚未重新完成 */
+const pendingReworks = computed(() => reworks.value.filter((row) => row.status === '待返工'))
+/** 某道工序是否被检验室点中返工（且尚未重新完成） */
+function isReworkTarget(seq: number): boolean {
+  return pendingReworks.value.some((row) => row.target?.seq === seq)
+}
+/** 某道工序对应的返工缺陷说明（用于工序台提示） */
+function reworkNoteOf(seq: number): string {
+  return pendingReworks.value.find((row) => row.target?.seq === seq)?.inspect.defectNote ?? ''
+}
+
 const batch = computed(() =>
   piece.value === null ? undefined : furnaceStore.batches.find((row) => row.id === piece.value?.batchId)
 )
@@ -238,6 +251,26 @@ function goAnnealing(): void {
         title="全部工序已完成，可以进入退火排位"
         :description="`理论退火时长 ${formatHours(totalAnnealHours(piece?.wallThicknessMm ?? 4))}（升温 / 保温 / 缓冷三段合计）。`"
       />
+      <el-alert
+        v-if="pendingReworks.length > 0"
+        type="error"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        :title="`检验室退回 ${pendingReworks.length} 道工序需返工（按道次序号退回，前面已确认的工序不抹掉）`"
+      >
+        <template #default>
+          <div class="rework-list">
+            <div v-for="row in pendingReworks" :key="row.inspect.id" class="rework-row">
+              <el-tag size="small" type="danger" effect="dark">返工</el-tag>
+              <span>
+                第 {{ row.target?.seq }} 道「{{ row.target?.name }}」：{{ row.inspect.result }} ·
+                {{ row.inspect.defectNote }}（{{ row.inspect.date }} 检验）
+              </span>
+            </div>
+          </div>
+        </template>
+      </el-alert>
 
       <el-card shadow="never">
         <template #header>
@@ -291,11 +324,13 @@ function goAnnealing(): void {
                 >
                   {{ row.state }}
                 </el-tag>
+                <el-tag v-if="isReworkTarget(row.seq)" size="small" type="danger" effect="dark">返工</el-tag>
                 <el-tag v-if="currentStep?.id === row.id" size="small" type="danger" effect="dark">当前道次</el-tag>
               </div>
               <div class="step-sub">
                 {{ row.tempC }} ℃ · {{ row.durationMin }} 分钟 · 操作人 {{ row.operator }}
                 <span v-if="row.remark !== ''"> · {{ row.remark }}</span>
+                <span v-if="isReworkTarget(row.seq)" class="rework-note"> · 返工：{{ reworkNoteOf(row.seq) }}</span>
               </div>
             </div>
             <div class="step-actions">
@@ -480,5 +515,23 @@ function goAnnealing(): void {
 
 .mb-14 {
   margin-bottom: 14px;
+}
+
+.rework-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+.rework-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.rework-note {
+  color: #c0392b;
 }
 </style>

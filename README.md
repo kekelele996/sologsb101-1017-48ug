@@ -42,7 +42,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 6 | 开发端口与宿主端口一致（22817） |
 | 路由 | Vue Router 4 | `createWebHistory` + 路由懒加载 |
 | 状态管理 | Pinia 2 | setup store，跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v2` 为 Piece 增加 craft 索引并回填默认值 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v3`：v2 为 Piece 增加 craft 索引并回填默认值；v3 拆分检验室与工序台返工账（`reworkStepSeq`），老记录留只读 |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -100,13 +100,16 @@ sologsb101-1017/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbglassblow`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 `[pieceId+seq]` 复合索引；
   * `db.version(2)`：**为 `Piece` 增加 `craft` 索引并回填默认值**，同时补齐其余索引与字段：
     * `.upgrade()` 中逐行回填 `revision` / `createdAt` / `updatedAt`；
     * `pieces.craft` 缺失时回填 `吹制`，`pieces.state` 缺失时回填 `设计中`；
     * `steps.state` 缺失时按历史记录视为 `已完成`，避免升级后被误判为待办；
     * `anneals` 补齐 `outAt` 与 `curveSeg`，`inspects` 补齐 `defectNote`。
+  * `db.version(3)`：**检验室与吹制工序台分账**——`inspects` 增加 `reworkStepSeq`（返工退回哪道工序）与 `legacyReadonly`（老记录只读）索引：
+    * `.upgrade()` 中对不合格且未指定返工道次的老记录，按当时的道次顺序（先认「第N道」再认工序名）拆到具体道次；
+    * 拆得到且该道次仍存在 → 回填 `reworkStepSeq`；拆不到或对不上 → 标记 `legacyReadonly = true`，**保留原样、只读、不可改派**。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -116,7 +119,7 @@ sologsb101-1017/
   | `pieces` | id | batchId, state, artist, **craft**, name |
   | `steps` | id | pieceId, **[pieceId+seq]**, seq, state, name |
   | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg |
-  | `inspects` | id | pieceId, date, result, inspector |
+  | `inspects` | id | pieceId, date, result, inspector, **reworkStepSeq, legacyReadonly** |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `furnaces` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **窑炉 → 料液批次 → 作品 → 吹制工序 → 退火 → 出炉检验** 三层互相引用：
@@ -162,6 +165,10 @@ npm run preview      # 预览 dist 产物
 * **工序温度校验**：不得超过所选窑炉的 `maxTempC`，且应落在工艺适宜区间（吹制 900–1200 ℃ / 铸造 800–1150 ℃ / 热塑 700–1000 ℃）附近。
 * **设计尺寸校验**：壁厚需 ≥ 1.5 mm 且小于设计高度的 1/8，否则给出成型与退火难度提示。
 * **前序阻断**：任一前序工序未推进到「已完成」，`/pieces/:id/steps` 的「进入退火排位」会给出明确阻断原因。
-* **状态回写**：退火状态推进到「已出炉」即把作品状态回写为「已退火」；登记出炉检验后回写为「已检验」；
-  判定不合格时生成返工提示，**原始工序记录完整保留**。
+* **状态回写**：退火状态推进到「已出炉」即把作品状态回写为「已退火」；登记出炉检验后回写为「已检验」。
+* **返工分账与对账**：检验室那份单子（`inspects`）管检验结论、缺陷说明与**返工退回哪道工序**（`reworkStepSeq`）；吹制工序台（`steps`）管每道工序的温度、时长、操作人。两边按**作品 + 道次序号**对账：
+  * 判定不合格时指定退回道次，工序台只把**被点中的那一道**从「已完成」退回「进行中」，**前面已确认的工序记录原样保留、不抹掉**；
+  * 对不上的（工序被删 / 序号重排后无此 seq）返工**先挂起**等确认，不落到别的道次上；
+  * 工序台保存失败按**本侧重试**（`withRetry` 只重试工序侧写操作），检验室那份不动；
+  * 升级前只记在作品上的老返工记录，按当时道次顺序拆到具体道次，拆不到的留作只读。
 * **料液扣减**：取料按剩余量扣减（不足时扣到 0），剩余量低于 60 kg 时列表行高亮并在顶部汇总提醒。

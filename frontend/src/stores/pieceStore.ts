@@ -7,6 +7,8 @@ import { defineStore } from 'pinia'
 import { liveQuery } from 'dexie'
 import type { Craft, Piece, PieceDraft, PieceState } from '../types/piece'
 import type { Step, StepDraft } from '../types/step'
+import type { Inspect, ReworkStatus } from '../types/inspect'
+import { deriveReworkStatus, findReworkTarget } from '../types/inspect'
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
@@ -18,8 +20,10 @@ import {
   removePiece,
   removeStep,
   reorderSteps,
+  reworkStep as reworkStepDb,
   syncPieceState,
 } from '../utils/db'
+import { withRetry } from '../utils/retry'
 import { buildStepProgress, type StepProgress } from '../hooks/useStepProgress'
 import { nowIso, uuid } from '../utils/id'
 
@@ -56,6 +60,7 @@ let subscribed = false
 export const usePieceStore = defineStore('piece', () => {
   const pieces = ref<Piece[]>([])
   const steps = ref<Step[]>([])
+  const inspects = ref<Inspect[]>([])
   const loading = ref(true)
   const ready = ref(false)
   const error = ref('')
@@ -87,6 +92,26 @@ export const usePieceStore = defineStore('piece', () => {
     return steps.value.filter((row) => row.pieceId === pieceId).sort((a, b) => a.seq - b.seq)
   }
 
+  /**
+   * 某件作品的返工对账：把检验室的不合格记录按「作品 + 道次序号」对上工序台的具体工序。
+   * 只返回指定了返工道次的不合格记录；状态由两边数据实时派生，不单独落库。
+   */
+  function reworksOf(pieceId: string): Array<{ inspect: Inspect; status: ReworkStatus; target: Step | null }> {
+    const pieceSteps = steps.value.filter((row) => row.pieceId === pieceId)
+    return inspects.value
+      .filter((row) => row.pieceId === pieceId && row.result !== '合格' && row.reworkStepSeq !== null)
+      .map((row) => ({
+        inspect: row,
+        status: deriveReworkStatus(row, pieceSteps),
+        target: findReworkTarget(row, pieceSteps),
+      }))
+  }
+
+  /** 某道工序是否被返工指向（且尚未重新完成），供工序台打「返工」标记 */
+  function stepNeedsRework(pieceId: string, seq: number): boolean {
+    return reworksOf(pieceId).some((row) => row.status === '待返工' && row.target?.seq === seq)
+  }
+
   function progressOf(pieceId: string): StepProgress {
     return buildStepProgress(pieceId, steps.value)
   }
@@ -103,13 +128,18 @@ export const usePieceStore = defineStore('piece', () => {
       if (!subscribed) {
         subscribed = true
         liveQuery(async () => {
-          const [pieceRows, stepRows] = await Promise.all([db.pieces.toArray(), db.steps.toArray()])
-          return { pieceRows, stepRows }
+          const [pieceRows, stepRows, inspectRows] = await Promise.all([
+            db.pieces.toArray(),
+            db.steps.toArray(),
+            db.inspects.toArray(),
+          ])
+          return { pieceRows, stepRows, inspectRows }
         }).subscribe({
-          next: ({ pieceRows, stepRows }) => {
+          next: ({ pieceRows, stepRows, inspectRows }) => {
             const sorted = [...pieceRows].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
             pieces.value = sorted
             steps.value = [...stepRows].sort((a, b) => a.pieceId.localeCompare(b.pieceId) || a.seq - b.seq)
+            inspects.value = [...inspectRows].sort((a, b) => b.date.localeCompare(a.date))
             loading.value = false
             ready.value = true
             error.value = ''
@@ -209,7 +239,8 @@ export const usePieceStore = defineStore('piece', () => {
       updatedAt: stamp,
       revision: ROW_REVISION,
     }
-    await putStep(row)
+    // 工序台保存：失败只重试本侧（putStep 内部只写 steps + 作品状态），检验室那份不动
+    await withRetry(() => putStep(row))
     revision.value += 1
     return row
   }
@@ -217,21 +248,23 @@ export const usePieceStore = defineStore('piece', () => {
   async function updateStep(stepId: string, draft: StepDraft): Promise<void> {
     const existing = steps.value.find((row) => row.id === stepId)
     if (existing === undefined) return
-    await putStep({
-      ...existing,
-      seq: draft.seq,
-      name: draft.name,
-      tempC: draft.tempC,
-      durationMin: draft.durationMin,
-      operator: draft.operator.trim(),
-      remark: draft.remark.trim(),
-      state: draft.state,
-    })
+    await withRetry(() =>
+      putStep({
+        ...existing,
+        seq: draft.seq,
+        name: draft.name,
+        tempC: draft.tempC,
+        durationMin: draft.durationMin,
+        operator: draft.operator.trim(),
+        remark: draft.remark.trim(),
+        state: draft.state,
+      }),
+    )
     revision.value += 1
   }
 
   async function deleteStep(stepId: string): Promise<void> {
-    await removeStep(stepId)
+    await withRetry(() => removeStep(stepId))
     revision.value += 1
     lastMessage.value = '工序已删除，作品状态已重新推导'
   }
@@ -247,12 +280,31 @@ export const usePieceStore = defineStore('piece', () => {
       return
     }
     const next = flow[index + 1]
-    await putStep({ ...existing, state: next })
+    await withRetry(() => putStep({ ...existing, state: next }))
     revision.value += 1
     const piece = pieces.value.find((row) => row.id === existing.pieceId)
     lastMessage.value = `第 ${existing.seq} 道「${existing.name}」已推进为「${next}」${
       piece === undefined ? '' : `（作品：${piece.name}）`
     }`
+  }
+
+  /**
+   * 工序台按检验室指定的道次返工：只重开被点中的那一道，前面已确认的工序记录不抹掉。
+   * 失败按本侧重试（只重试工序侧写操作），检验室那份不动。
+   * 返回 null 表示该道次对不上（工序被删 / 序号重排），检验室那笔已挂起等确认。
+   */
+  async function reworkStep(pieceId: string, seq: number): Promise<Step | null> {
+    const target = await withRetry(() => reworkStepDb(pieceId, seq))
+    if (target === null) {
+      lastMessage.value = `第 ${seq} 道返工对不上工序（可能已被删除或重排），检验室那笔已挂起，请确认退回道次`
+      return null
+    }
+    revision.value += 1
+    const piece = pieces.value.find((row) => row.id === pieceId)
+    lastMessage.value = `已按检验室要求退回第 ${seq} 道「${target.name}」返工，前面已确认的工序记录保留不变${
+      piece === undefined ? '' : `（作品：${piece.name}）`
+    }`
+    return target
   }
 
   /** 拖拽排序：把 fromId 移动到 toId 之前 */
@@ -264,7 +316,7 @@ export const usePieceStore = defineStore('piece', () => {
     if (fromIndex < 0 || toIndex < 0) return
     const [moved] = list.splice(fromIndex, 1)
     list.splice(toIndex, 0, moved)
-    await reorderSteps(list.map((row) => row.id))
+    await withRetry(() => reorderSteps(list.map((row) => row.id)))
     revision.value += 1
     lastMessage.value = `已调整工序顺序：「${moved.name}」移动到第 ${toIndex + 1} 道`
   }
@@ -277,7 +329,7 @@ export const usePieceStore = defineStore('piece', () => {
     const [moved] = list.splice(fromIndex, 1)
     const index = Math.max(0, Math.min(list.length, targetIndex))
     list.splice(index, 0, moved)
-    await reorderSteps(list.map((row) => row.id))
+    await withRetry(() => reorderSteps(list.map((row) => row.id)))
     revision.value += 1
     lastMessage.value = `已把「${moved.name}」调整到第 ${index + 1} 道`
   }
@@ -297,6 +349,7 @@ export const usePieceStore = defineStore('piece', () => {
   return {
     pieces,
     steps,
+    inspects,
     loading,
     ready,
     error,
@@ -310,6 +363,8 @@ export const usePieceStore = defineStore('piece', () => {
     inProgressCount,
     stepsOf,
     progressOf,
+    reworksOf,
+    stepNeedsRework,
     loadAll,
     selectPiece,
     setFilters,
@@ -321,6 +376,7 @@ export const usePieceStore = defineStore('piece', () => {
     updateStep,
     deleteStep,
     advanceStep,
+    reworkStep,
     moveStepBefore,
     moveStepToIndex,
     resyncPieceState,
