@@ -62,25 +62,27 @@ export async function seedDatabase(): Promise<void> {
   ]
 
   // ---------------- 吹制工序（每件 2–5 道，seq 连续） ----------------
-  const steps: Step[] = [
-    wrap<Step>({ id: 'step-m1', pieceId: SEED_IDS.pieceMorning, seq: 1, name: '取料', tempC: 1180, durationMin: 3.5, operator: '林曦', remark: '取 G-101 料液约 6.2 kg', state: '已完成' }),
-    wrap<Step>({ id: 'step-m2', pieceId: SEED_IDS.pieceMorning, seq: 2, name: '吹制', tempC: 1120, durationMin: 6, operator: '林曦', remark: '分三次吹气成型', state: '已完成' }),
-    wrap<Step>({ id: 'step-m3', pieceId: SEED_IDS.pieceMorning, seq: 3, name: '塑形', tempC: 980, durationMin: 8.5, operator: '沈沐', remark: '夹持颈部收细', state: '进行中' }),
-    wrap<Step>({ id: 'step-m4', pieceId: SEED_IDS.pieceMorning, seq: 4, name: '收口', tempC: 860, durationMin: 4, operator: '林曦', remark: '口沿回火处理', state: '未开始' }),
-    wrap<Step>({ id: 'step-g1', pieceId: SEED_IDS.pieceGreen, seq: 1, name: '取料', tempC: 1120, durationMin: 4, operator: '沈沐', remark: '取 C-330 料液约 9.5 kg', state: '已完成' }),
-    wrap<Step>({ id: 'step-g2', pieceId: SEED_IDS.pieceGreen, seq: 2, name: '开模', tempC: 940, durationMin: 12, operator: '沈沐', remark: '石膏模浇注', state: '已完成' }),
-    wrap<Step>({ id: 'step-g3', pieceId: SEED_IDS.pieceGreen, seq: 3, name: '塑形', tempC: 900, durationMin: 9, operator: '郑野', remark: '修整碗口与底足', state: '已完成' }),
-    wrap<Step>({ id: 'step-p1', pieceId: SEED_IDS.piecePaperweight, seq: 1, name: '取料', tempC: 1160, durationMin: 2.5, operator: '郑野', remark: '取 A-207 料液约 3.1 kg', state: '已完成' }),
-    wrap<Step>({ id: 'step-p2', pieceId: SEED_IDS.piecePaperweight, seq: 2, name: '塑形', tempC: 1020, durationMin: 7, operator: '郑野', remark: '压制成型后回火', state: '进行中' }),
-    wrap<Step>({ id: 'step-b1', pieceId: SEED_IDS.pieceBottle, seq: 1, name: '取料', tempC: 1170, durationMin: 3, operator: '林曦', remark: '取 T-045 料液约 7.8 kg', state: '已完成' }),
-    wrap<Step>({ id: 'step-b2', pieceId: SEED_IDS.pieceBottle, seq: 2, name: '吹制', tempC: 1110, durationMin: 7.5, operator: '林曦', remark: '长颈一次吹成', state: '已完成' }),
-    wrap<Step>({ id: 'step-b3', pieceId: SEED_IDS.pieceBottle, seq: 3, name: '塑形', tempC: 990, durationMin: 10, operator: '沈沐', remark: '拉长颈部至 340 mm', state: '已完成' }),
-    wrap<Step>({ id: 'step-b4', pieceId: SEED_IDS.pieceBottle, seq: 4, name: '开模', tempC: 900, durationMin: 6, operator: '郑野', remark: '脱模检查瓶身', state: '已完成' }),
-    wrap<Step>({ id: 'step-b5', pieceId: SEED_IDS.pieceBottle, seq: 5, name: '收口', tempC: 840, durationMin: 5, operator: '林曦', remark: '口沿打磨回火', state: '已完成' }),
-    wrap<Step>({ id: 'step-c1', pieceId: SEED_IDS.pieceCup, seq: 1, name: '取料', tempC: 1180, durationMin: 3, operator: '沈沐', remark: '取 G-101 料液约 2.4 kg', state: '已完成' }),
-    wrap<Step>({ id: 'step-c2', pieceId: SEED_IDS.pieceCup, seq: 2, name: '吹制', tempC: 1130, durationMin: 5.5, operator: '沈沐', remark: '杯身一次成型', state: '已完成' }),
-    wrap<Step>({ id: 'step-c3', pieceId: SEED_IDS.pieceCup, seq: 3, name: '塑形', tempC: 1000, durationMin: 8, operator: '林曦', remark: '接杯柄并回火', state: '已完成' }),
+  // reworkMark 为工序台本侧返工标记；播种数据默认均未返工，由 wrapStep 统一补 false。
+  const stepDefs: Array<Omit<Step, 'createdAt' | 'updatedAt' | 'revision' | 'reworkMark'>> = [
+    { id: 'step-m1', pieceId: SEED_IDS.pieceMorning, seq: 1, name: '取料', tempC: 1180, durationMin: 3.5, operator: '林曦', remark: '取 G-101 料液约 6.2 kg', state: '已完成' },
+    { id: 'step-m2', pieceId: SEED_IDS.pieceMorning, seq: 2, name: '吹制', tempC: 1120, durationMin: 6, operator: '林曦', remark: '分三次吹气成型', state: '已完成' },
+    { id: 'step-m3', pieceId: SEED_IDS.pieceMorning, seq: 3, name: '塑形', tempC: 980, durationMin: 8.5, operator: '沈沐', remark: '夹持颈部收细', state: '进行中' },
+    { id: 'step-m4', pieceId: SEED_IDS.pieceMorning, seq: 4, name: '收口', tempC: 860, durationMin: 4, operator: '林曦', remark: '口沿回火处理', state: '未开始' },
+    { id: 'step-g1', pieceId: SEED_IDS.pieceGreen, seq: 1, name: '取料', tempC: 1120, durationMin: 4, operator: '沈沐', remark: '取 C-330 料液约 9.5 kg', state: '已完成' },
+    { id: 'step-g2', pieceId: SEED_IDS.pieceGreen, seq: 2, name: '开模', tempC: 940, durationMin: 12, operator: '沈沐', remark: '石膏模浇注', state: '已完成' },
+    { id: 'step-g3', pieceId: SEED_IDS.pieceGreen, seq: 3, name: '塑形', tempC: 900, durationMin: 9, operator: '郑野', remark: '修整碗口与底足', state: '已完成' },
+    { id: 'step-p1', pieceId: SEED_IDS.piecePaperweight, seq: 1, name: '取料', tempC: 1160, durationMin: 2.5, operator: '郑野', remark: '取 A-207 料液约 3.1 kg', state: '已完成' },
+    { id: 'step-p2', pieceId: SEED_IDS.piecePaperweight, seq: 2, name: '塑形', tempC: 1020, durationMin: 7, operator: '郑野', remark: '压制成型后回火', state: '进行中' },
+    { id: 'step-b1', pieceId: SEED_IDS.pieceBottle, seq: 1, name: '取料', tempC: 1170, durationMin: 3, operator: '林曦', remark: '取 T-045 料液约 7.8 kg', state: '已完成' },
+    { id: 'step-b2', pieceId: SEED_IDS.pieceBottle, seq: 2, name: '吹制', tempC: 1110, durationMin: 7.5, operator: '林曦', remark: '长颈一次吹成', state: '已完成' },
+    { id: 'step-b3', pieceId: SEED_IDS.pieceBottle, seq: 3, name: '塑形', tempC: 990, durationMin: 10, operator: '沈沐', remark: '拉长颈部至 340 mm', state: '已完成' },
+    { id: 'step-b4', pieceId: SEED_IDS.pieceBottle, seq: 4, name: '开模', tempC: 900, durationMin: 6, operator: '郑野', remark: '脱模检查瓶身', state: '已完成' },
+    { id: 'step-b5', pieceId: SEED_IDS.pieceBottle, seq: 5, name: '收口', tempC: 840, durationMin: 5, operator: '林曦', remark: '口沿打磨回火', state: '已完成' },
+    { id: 'step-c1', pieceId: SEED_IDS.pieceCup, seq: 1, name: '取料', tempC: 1180, durationMin: 3, operator: '沈沐', remark: '取 G-101 料液约 2.4 kg', state: '已完成' },
+    { id: 'step-c2', pieceId: SEED_IDS.pieceCup, seq: 2, name: '吹制', tempC: 1130, durationMin: 5.5, operator: '沈沐', remark: '杯身一次成型', state: '已完成' },
+    { id: 'step-c3', pieceId: SEED_IDS.pieceCup, seq: 3, name: '塑形', tempC: 1000, durationMin: 8, operator: '林曦', remark: '接杯柄并回火', state: '已完成' },
   ]
+  const steps: Step[] = stepDefs.map((row) => wrap<Step>({ ...row, reworkMark: false }))
 
   // ---------------- 退火（4 条，窑位互不冲突；含已出炉 / 退火中 / 待入窑） ----------------
   const anneals: Anneal[] = [
@@ -90,11 +92,31 @@ export async function seedDatabase(): Promise<void> {
     wrap<Anneal>({ id: 'anneal-m1', pieceId: SEED_IDS.pieceMorning, kilnSlot: 'AN-01-B1', curveSeg: '保温', inAt: '2026-10-02T10:00', outAt: '', state: '待入窑' }),
   ]
 
-  // ---------------- 出炉检验（2–3 条，含不合格与返工后复检合格） ----------------
+  // ---------------- 出炉检验（含不合格返工、返工后复检合格、待领取返工） ----------------
+  // 返工只点中一道工序（作品 + 道次序号 + 锚定 id），前序确认过的工序记录保留不变。
   const inspects: Inspect[] = [
-    wrap<Inspect>({ id: 'inspect-b1', pieceId: SEED_IDS.pieceBottle, result: '合格', defectNote: '', inspector: '吴岚', date: '2026-09-28' }),
-    wrap<Inspect>({ id: 'inspect-g1', pieceId: SEED_IDS.pieceGreen, result: '裂纹', defectNote: '口沿下方 12 mm 处有细裂纹，需回炉修补；原始工序记录保留不变。', inspector: '吴岚', date: '2026-09-22' }),
-    wrap<Inspect>({ id: 'inspect-g2', pieceId: SEED_IDS.pieceGreen, result: '合格', defectNote: '回炉修补后复检合格。', inspector: '吴岚', date: '2026-09-25' }),
+    wrap<Inspect>({
+      id: 'inspect-b1', pieceId: SEED_IDS.pieceBottle, result: '合格', defectNote: '', inspector: '吴岚', date: '2026-09-28',
+      reworkStepSeq: 0, reworkStepId: '', reworkClosed: false, reworkClosedBy: '', legacy: false,
+    }),
+    wrap<Inspect>({
+      id: 'inspect-g1', pieceId: SEED_IDS.pieceGreen, result: '裂纹',
+      defectNote: '口沿下方 12 mm 处有细裂纹，需回炉修补；原始工序记录保留不变。',
+      inspector: '吴岚', date: '2026-09-22',
+      // 点中第 2 道「开模」，已由 09-25 的合格复检关闭
+      reworkStepSeq: 2, reworkStepId: 'step-g2', reworkClosed: true, reworkClosedBy: 'inspect-g2', legacy: false,
+    }),
+    wrap<Inspect>({
+      id: 'inspect-g2', pieceId: SEED_IDS.pieceGreen, result: '合格', defectNote: '回炉修补后复检合格。', inspector: '吴岚', date: '2026-09-25',
+      reworkStepSeq: 0, reworkStepId: '', reworkClosed: false, reworkClosedBy: '', legacy: false,
+    }),
+    wrap<Inspect>({
+      id: 'inspect-c1', pieceId: SEED_IDS.pieceCup, result: '变形',
+      defectNote: '杯柄连接处轻微走形，退回第 3 道「塑形」重新接柄回火；前两道记录保留。',
+      inspector: '吴岚', date: '2026-10-01',
+      // 退火出炉后判定返工：点中第 3 道，工序台尚未领取
+      reworkStepSeq: 3, reworkStepId: 'step-c3', reworkClosed: false, reworkClosedBy: '', legacy: false,
+    }),
   ]
 
   await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects], async () => {

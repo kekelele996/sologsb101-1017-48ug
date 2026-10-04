@@ -42,7 +42,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 6 | 开发端口与宿主端口一致（22817） |
 | 路由 | Vue Router 4 | `createWebHistory` + 路由懒加载 |
 | 状态管理 | Pinia 2 | setup store，跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v2` 为 Piece 增加 craft 索引并回填默认值 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v2` 为 Piece 增加 craft 索引；`v2 → v3` 把返工从作品级拆到「作品 + 道次序号」 |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -88,7 +88,7 @@ sologsb101-1017/
 | `/pieces` | `pages/PieceList.vue` | 作品登记与设计尺寸录入：按工艺与状态筛选、设计尺寸比例校验、显示工序完成度与当前道次 |
 | `/pieces/:id/steps` | `pages/StepDetail.vue` | 吹制工序逐道记录：拖拽排序、回填温度/时长/操作人、推进工序状态、前序未完成阻断进入退火排位 |
 | `/annealing` | `pages/AnnealingBoard.vue` | 退火窑位分配与曲线编排：窑位占用表、**窑位冲突时禁用提交**、状态流转、出炉回写作品状态 |
-| `/export` | `pages/ExportView.vue` | 出炉检验登记（不合格生成返工提示）+ JSON 结构版本查看与导入导出 + 窑务 CSV 汇总 |
+| `/export` | `pages/ExportView.vue` | 出炉检验登记（不合格按作品 + 道次序号点返工，对账不上挂起确认）+ JSON 结构版本查看与导入导出 + 窑务 CSV 汇总 |
 
 `/` 重定向到 `/furnaces`，未匹配路径统一回落到 `/furnaces`。
 **层级路由支持直接深链**：把 `http://localhost:22817/pieces/piece-morning-vase/steps` 直接粘贴到地址栏即可打开；
@@ -100,13 +100,27 @@ sologsb101-1017/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbglassblow`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 `[pieceId+seq]` 复合索引；
   * `db.version(2)`：**为 `Piece` 增加 `craft` 索引并回填默认值**，同时补齐其余索引与字段：
     * `.upgrade()` 中逐行回填 `revision` / `createdAt` / `updatedAt`；
     * `pieces.craft` 缺失时回填 `吹制`，`pieces.state` 缺失时回填 `设计中`；
     * `steps.state` 缺失时按历史记录视为 `已完成`，避免升级后被误判为待办；
     * `anneals` 补齐 `outAt` 与 `curveSeg`，`inspects` 补齐 `defectNote`。
+  * `db.version(3)`：**检验返工从「只记在作品上」拆到「作品 + 道次序号」**，两边分账、按道次对账：
+    * `inspects` 增加 `[pieceId+reworkStepSeq]` 复合索引与 `reworkStepSeq` / `reworkStepId` /
+      `reworkClosed` / `reworkClosedBy` / `legacy` 字段；`steps` 增加本侧 `reworkMark`；
+    * 升级时把旧的作品级不合格记录**按当时的道次顺序**拆到最后一道并锚定工序 id；
+      该作品若有更晚的合格复检，则把旧返工标记为已关闭；
+    * 实在对不上（作品已无任何工序）的老记录置 `legacy` 且不锚定，界面上**只读保留**、不可编辑删除。
+* **检验室与工序台分账（v3 核心规则）**：
+  * **检验室（`inspects`）**只记检验结论、缺陷说明、返工退回哪道工序；
+    **吹制工序台（`steps`）**只记每道工序的温度、时长、操作人。两张表互不代写。
+  * 返工**只退回被点中的那一道**：工序台「领取返工」仅把该道重开（`reworkMark=true`、退回进行中），
+    前面确认过的工序记录原样保留，绝不抹掉；该道重做完成进入「待复检」，合格复检才关闭返工。
+  * 两边**按作品 + 道次序号对账**，`reworkStepId` 作重排锚点；隔天工序重排导致对不上时，
+    返工先**挂起等确认**，不会自动落到别的道次，挂起期间阻断推进与退火排位。
+  * 工序台保存失败时**只在本侧重试**（`utils/retry.ts`，仅重试 steps 表写入），检验室那份不动。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -116,7 +130,7 @@ sologsb101-1017/
   | `pieces` | id | batchId, state, artist, **craft**, name |
   | `steps` | id | pieceId, **[pieceId+seq]**, seq, state, name |
   | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg |
-  | `inspects` | id | pieceId, date, result, inspector |
+  | `inspects` | id | pieceId, date, result, inspector, **[pieceId+reworkStepSeq]** |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `furnaces` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **窑炉 → 料液批次 → 作品 → 吹制工序 → 退火 → 出炉检验** 三层互相引用：
@@ -124,7 +138,7 @@ sologsb101-1017/
   * 4 批料液（含 `A-207` 剩余 42 kg，故意低于 60 kg 补料阈值用于验证高亮与提醒）；
   * 5 件作品（覆盖四种状态与三种工艺）、17 道吹制工序（每件 2–5 道，seq 连续）；
   * 4 条退火记录（窑位 A1/A2/A3/B1 互不冲突，覆盖已出炉 / 退火中 / 待入窑）；
-  * 3 条出炉检验（含一条「裂纹」不合格 + 一条返工后复检合格）。
+  * 4 条出炉检验（含「裂纹」返工后复检合格、一条「变形」待工序台领取的返工，锚定到赤霞杯第 3 道）。
   * 固定 id 如 `piece-morning-vase`、`piece-frost-bottle` 可直接用于深链验证。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的作品 id」这一界面偏好，不存业务数据。
 * 删除窑炉会级联清理其料液批次；删除作品会级联清理其工序、退火与检验记录（均在同一 Dexie 事务内完成）。
@@ -163,5 +177,7 @@ npm run preview      # 预览 dist 产物
 * **设计尺寸校验**：壁厚需 ≥ 1.5 mm 且小于设计高度的 1/8，否则给出成型与退火难度提示。
 * **前序阻断**：任一前序工序未推进到「已完成」，`/pieces/:id/steps` 的「进入退火排位」会给出明确阻断原因。
 * **状态回写**：退火状态推进到「已出炉」即把作品状态回写为「已退火」；登记出炉检验后回写为「已检验」；
-  判定不合格时生成返工提示，**原始工序记录完整保留**。
+  判定不合格时只向被点中的道次（作品 + 道次序号）挂返工，**前面确认过的原始工序记录完整保留**。
+  返工流程为「待接收 → 返工中（本道重开）→ 待复检 → 合格复检关闭」；
+  对账不上（道次被删 / 重排后序号错位）时返工挂起等确认，挂起与未平返工都阻断进入退火排位。
 * **料液扣减**：取料按剩余量扣减（不足时扣到 0），剩余量低于 60 kg 时列表行高亮并在顶部汇总提醒。

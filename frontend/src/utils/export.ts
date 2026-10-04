@@ -12,6 +12,7 @@ import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
 import { stampSuffix } from './id'
 import { formatHours, isLowRemain, segmentHours, totalAnnealHours } from './thermal'
+import { reconcileInspect } from './rework'
 
 /** 触发浏览器下载 */
 export function download(filename: string, content: string, mime: string): void {
@@ -103,6 +104,8 @@ export function buildScheduleCsv(
     '理论退火时长',
     '检验次数',
     '最近检验结果',
+    '未平返工件数',
+    '返工退回道次',
   ]
   const lines: string[] = [header.map(csvCell).join(',')]
   pieces.forEach((piece) => {
@@ -113,6 +116,19 @@ export function buildScheduleCsv(
     const latestAnneal = pieceAnneals.length > 0 ? pieceAnneals[pieceAnneals.length - 1] : null
     const pieceInspects = inspects.filter((row) => row.pieceId === piece.id).sort((a, b) => a.date.localeCompare(b.date))
     const latestInspect = pieceInspects.length > 0 ? pieceInspects[pieceInspects.length - 1] : null
+    // 返工对账：未平（待接收 / 返工中 / 待复检 / 挂起）的返工点中的道次序号
+    const openReworkSeqs = pieceInspects
+      .map((row) => ({ inspect: row, status: reconcileInspect(row, pieceSteps) }))
+      .filter(
+        (entry) =>
+          entry.status.phase !== '无返工' &&
+          entry.status.phase !== '只读老记录',
+      )
+      .map((entry) =>
+        entry.status.phase === '挂起'
+          ? `第${entry.inspect.reworkStepSeq}道(挂起)`
+          : `第${entry.inspect.reworkStepSeq}道(${entry.status.phase})`,
+      )
     lines.push(
       [
         piece.name,
@@ -132,6 +148,8 @@ export function buildScheduleCsv(
         formatHours(totalAnnealHours(piece.wallThicknessMm)),
         pieceInspects.length,
         latestInspect?.result ?? '—',
+        openReworkSeqs.length,
+        openReworkSeqs.join('；') || '—',
       ]
         .map(csvCell)
         .join(','),

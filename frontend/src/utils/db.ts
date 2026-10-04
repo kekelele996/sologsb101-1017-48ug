@@ -12,17 +12,24 @@ import type { Piece, PieceState } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
+import { NO_REWORK_SEQ } from '../types/inspect'
 import { nowIso } from './id'
 import { seedDatabase } from './seed'
+import { retryLocal } from './retry'
 
 /** 数据库名 */
 export const DB_NAME = 'gbglassblow'
 
-/** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+/**
+ * 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移）
+ * v1 → v2：Piece 增加 craft 索引并回填默认值；
+ * v2 → v3：检验返工从「只记在作品上」拆到具体道次（作品 + 道次序号），
+ *          旧记录按当时道次顺序拆分，对不上的标为 legacy 只读保留。
+ */
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 class GlassBlowDatabase extends Dexie {
   furnaces!: Table<Furnace, string>
@@ -91,6 +98,83 @@ class GlassBlowDatabase extends Dexie {
         // 迁移 5：检验记录补齐缺陷说明
         await tx.table('inspects').toCollection().modify((row: Record<string, unknown>) => {
           if (typeof row.defectNote !== 'string') row.defectNote = ''
+        })
+      })
+
+    // ---------- v3：返工从作品级拆到「作品 + 道次序号」，工序侧新增返工标记 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
+        batches: 'id, furnaceId, colorCode, meltDate, remainKg',
+        pieces: 'id, batchId, state, artist, craft, name',
+        steps: 'id, pieceId, [pieceId+seq], seq, state, name',
+        anneals: 'id, pieceId, kilnSlot, state, inAt, curveSeg',
+        // [pieceId+reworkStepSeq]：两边按作品 + 道次序号对账
+        inspects: 'id, pieceId, date, result, inspector, [pieceId+reworkStepSeq]',
+      })
+      .upgrade(async (tx) => {
+        // 迁移 1：工序台补齐本侧返工标记
+        await tx.table('steps').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.reworkMark !== 'boolean') row.reworkMark = false
+        })
+
+        // 迁移 2：检验室返工字段补齐，并把「只记在作品上」的旧返工按当时道次顺序拆开
+        const stepRows = await tx.table('steps').toCollection().toArray()
+        const stepsByPiece = new Map<string, Array<{ id: string; seq: number }>>()
+        stepRows.forEach((raw) => {
+          const step = raw as Record<string, unknown>
+          const pieceId = typeof step.pieceId === 'string' ? step.pieceId : ''
+          const seq = typeof step.seq === 'number' ? step.seq : 0
+          if (pieceId === '' || seq <= 0) return
+          const list = stepsByPiece.get(pieceId) ?? []
+          list.push({ id: String(step.id), seq })
+          stepsByPiece.set(pieceId, list)
+        })
+        stepsByPiece.forEach((list) => list.sort((a, b) => a.seq - b.seq))
+
+        // 升级窗口内一次性读出作品是否有「之后」的合格复检，用于关闭已完成的旧返工
+        const inspectRows = await tx.table('inspects').toCollection().toArray()
+        const passDatesByPiece = new Map<string, string[]>()
+        inspectRows.forEach((raw) => {
+          const item = raw as Record<string, unknown>
+          if (item.result === '合格' && typeof item.pieceId === 'string' && typeof item.date === 'string') {
+            const list = passDatesByPiece.get(item.pieceId) ?? []
+            list.push(item.date)
+            passDatesByPiece.set(item.pieceId, list)
+          }
+        })
+
+        await tx.table('inspects').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.reworkClosed !== 'boolean') row.reworkClosed = false
+          if (typeof row.reworkClosedBy !== 'string') row.reworkClosedBy = ''
+          if (typeof row.legacy !== 'boolean') row.legacy = false
+          if (typeof row.reworkStepId !== 'string') row.reworkStepId = ''
+          if (typeof row.reworkStepSeq !== 'number') row.reworkStepSeq = NO_REWORK_SEQ
+
+          // 只处理 v2 及以前「返工只记在作品上」的老不合格记录
+          const isOldRework =
+            row.result !== '合格' &&
+            (typeof row.reworkStepSeq !== 'number' || (row.reworkStepSeq as number) <= 0) &&
+            row.reworkClosed === false
+          if (!isOldRework) return
+
+          row.legacy = true
+          const pieceId = typeof row.pieceId === 'string' ? row.pieceId : ''
+          const order = stepsByPiece.get(pieceId) ?? []
+          if (order.length > 0) {
+            // 按当时的道次顺序，返工默认退回到最后一道（旧数据只记在作品上，取最靠近出炉的那道）
+            const last = order[order.length - 1]
+            row.reworkStepSeq = last.seq
+            row.reworkStepId = last.id
+            const passDates = passDatesByPiece.get(pieceId) ?? []
+            if (passDates.some((date) => date > String(row.date))) {
+              row.reworkClosed = true
+            }
+          } else {
+            // 对不上的老记录：保留只读，不允许再参与流转
+            row.reworkStepSeq = NO_REWORK_SEQ
+            row.reworkStepId = ''
+          }
         })
       })
   }
@@ -219,25 +303,83 @@ export async function listStepsByPiece(pieceId: string): Promise<Step[]> {
   return rows.sort((a, b) => a.seq - b.seq)
 }
 
+/**
+ * 保存一道工序（吹制工序台这一侧）。
+ * 只重试 steps 表的写入：工序台保存失败按本侧重试，检验室那份（inspects）不动。
+ * syncPieceState 是读多表后的状态推导，失败不影响工序本身已落库。
+ */
 export async function putStep(row: Step): Promise<void> {
-  await db.steps.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
-  await syncPieceState(row.pieceId)
+  await retryLocal(async () => {
+    await db.steps.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
+  })
+  try {
+    await syncPieceState(row.pieceId)
+  } catch {
+    /* 状态推导失败不回滚工序记录；下次任意保存会重新推导 */
+  }
 }
 
 export async function removeStep(id: string): Promise<void> {
   const step = await db.steps.get(id)
   if (!step) return
-  await db.steps.delete(id)
+  await retryLocal(async () => {
+    await db.steps.delete(id)
+  })
   await syncPieceState(step.pieceId)
 }
 
-/** 按给定 id 顺序重写工序序号（拖拽排序后调用） */
+/** 按给定 id 顺序重写工序序号（拖拽排序后调用）；整体在本侧重试，不碰检验表 */
 export async function reorderSteps(orderedIds: string[]): Promise<void> {
-  await db.transaction('rw', db.steps, async () => {
-    for (let index = 0; index < orderedIds.length; index += 1) {
-      await db.steps.update(orderedIds[index], { seq: index + 1, updatedAt: nowIso() })
-    }
+  await retryLocal(async () => {
+    await db.transaction('rw', db.steps, async () => {
+      for (let index = 0; index < orderedIds.length; index += 1) {
+        await db.steps.update(orderedIds[index], { seq: index + 1, updatedAt: nowIso() })
+      }
+    })
   })
+}
+
+/**
+ * 工序台领取返工：把被点中的那道工序重开（reworkMark=true、状态退回「进行中」）。
+ * 只写 steps 这一张表并重试；不删除、不改写前面已确认工序的任何记录，也不触碰 inspects。
+ */
+export async function receiveRework(inspectId: string, allInspects: Inspect[], allSteps: Step[]): Promise<boolean> {
+  const inspect = allInspects.find((row) => row.id === inspectId)
+  if (!inspect || inspect.result === '合格' || inspect.reworkClosed) return false
+  const target = allSteps
+    .filter((step) => step.pieceId === inspect.pieceId)
+    .sort((a, b) => a.seq - b.seq)
+    .find((step) => inspect.reworkStepId !== '' && step.id === inspect.reworkStepId)
+  if (!target) return false
+  await retryLocal(async () => {
+    await db.steps.put({
+      ...target,
+      state: '进行中',
+      reworkMark: true,
+      updatedAt: nowIso(),
+      revision: ROW_REVISION,
+    })
+  })
+  return true
+}
+
+/**
+ * 返工重做后推进该道完成（完成即「待复检」，等检验室合格复检关闭返工）。
+ * 同样只写 steps 表并重试。
+ */
+export async function completeReworkedStep(stepId: string, allSteps: Step[]): Promise<boolean> {
+  const step = allSteps.find((row) => row.id === stepId)
+  if (!step || !step.reworkMark) return false
+  await retryLocal(async () => {
+    await db.steps.put({
+      ...step,
+      state: '已完成',
+      reworkMark: true,
+      updatedAt: nowIso(),
+      revision: ROW_REVISION,
+    })
+  })
+  return true
 }
 
 /* -------------------------------- 退火 -------------------------------- */
@@ -288,10 +430,115 @@ export async function putInspect(row: Inspect): Promise<void> {
   await syncPieceState(row.pieceId)
 }
 
+/**
+ * 检验室保存一份检验（新增或编辑）。
+ * 检验室只管检验结论、缺陷说明、返工退回哪道工序；不写工序的温度 / 时长 / 操作人。
+ *
+ * 合格复检会自动关闭该作品此前尚未关闭的返工，并清除对应工序的返工标记；
+ * 判定不合格时必须带「作品 + 道次序号」，只点中一道工序，前序已确认记录保持不变。
+ * 返回值：成功落库后的检验记录。
+ */
+export async function saveInspect(
+  inspect: Inspect,
+  options: { existing?: Inspect | undefined } = {},
+): Promise<Inspect> {
+  const isPass = inspect.result === '合格'
+  const next: Inspect = {
+    ...inspect,
+    reworkStepSeq: isPass ? NO_REWORK_SEQ : Math.max(1, inspect.reworkStepSeq),
+    reworkStepId: isPass ? '' : inspect.reworkStepId,
+    revision: ROW_REVISION,
+  }
+
+  await db.transaction('rw', db.inspects, db.steps, db.pieces, async (tx) => {
+    // 合格复检：关闭该作品所有未关闭的返工
+    if (isPass) {
+      const openList = await tx
+        .table('inspects')
+        .where('pieceId')
+        .equals(next.pieceId)
+        .toArray()
+      for (const raw of openList) {
+        const row = raw as Inspect
+        if (row.id === next.id) continue
+        if (row.result !== '合格' && !row.reworkClosed) {
+          await tx.table('inspects').update(row.id, {
+            reworkClosed: true,
+            reworkClosedBy: next.id,
+            updatedAt: nowIso(),
+          })
+          // 清掉对应工序上的返工标记；工序本身的温度 / 时长 / 操作人记录不动
+          if (row.reworkStepId !== '') {
+            await tx
+              .table('steps')
+              .where('pieceId')
+              .equals(next.pieceId)
+              .modify((step: Step) => {
+                if (step.id === row.reworkStepId && step.reworkMark) {
+                  step.reworkMark = false
+                  step.updatedAt = nowIso()
+                }
+              })
+          }
+        }
+      }
+      next.reworkClosed = false
+      next.reworkClosedBy = ''
+    } else {
+      next.reworkClosed = false
+      next.reworkClosedBy = ''
+      // 锚定当前道次序号对应的工序 id（编辑一条已挂起的返工时，由这里重新对上）
+      if (next.reworkStepId === '') {
+        const step = await tx
+          .table('steps')
+          .where('pieceId')
+          .equals(next.pieceId)
+          .toArray()
+        const pinned = (step as Step[]).find((row) => row.seq === next.reworkStepSeq)
+        next.reworkStepId = pinned?.id ?? ''
+      }
+    }
+
+    // 若编辑后从「不合格」变为其它情形，释放原锚定工序上的本侧返工标记
+    const existing = options.existing
+    if (existing && existing.reworkStepId !== '' && (isPass || existing.reworkStepId !== next.reworkStepId)) {
+      await tx
+        .table('steps')
+        .where('pieceId')
+        .equals(next.pieceId)
+        .modify((step: Step) => {
+          if (step.id === existing.reworkStepId && step.reworkMark) {
+            step.reworkMark = false
+            step.updatedAt = nowIso()
+          }
+        })
+    }
+
+    next.updatedAt = nowIso()
+    await tx.table('inspects').put(next)
+  })
+
+  await syncPieceState(next.pieceId)
+  return next
+}
+
 export async function removeInspect(id: string): Promise<void> {
   const row = await db.inspects.get(id)
   if (!row) return
-  await db.inspects.delete(id)
+  await db.transaction('rw', db.inspects, db.steps, async () => {
+    // 删除一条未关闭的返工时，顺手释放对应工序的本侧返工标记（不删工序记录）
+    if (!row.reworkClosed && row.reworkStepId !== '') {
+      await db.steps
+        .where('pieceId')
+        .equals(row.pieceId)
+        .modify((step: Step) => {
+          if (step.id === row.reworkStepId && step.reworkMark) {
+            step.reworkMark = false
+          }
+        })
+    }
+    await db.inspects.delete(id)
+  })
   await syncPieceState(row.pieceId)
 }
 
@@ -322,6 +569,21 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
+  // 兼容旧版存档：补齐 v3 新增字段（steps.reworkMark / inspects 返工指向）
+  const normalizedSteps = snapshot.steps.map((row) => ({
+    ...row,
+    reworkMark: typeof row.reworkMark === 'boolean' ? row.reworkMark : false,
+    revision: ROW_REVISION,
+  }))
+  const normalizedInspects = snapshot.inspects.map((row) => ({
+    ...row,
+    reworkStepSeq: typeof row.reworkStepSeq === 'number' ? row.reworkStepSeq : NO_REWORK_SEQ,
+    reworkStepId: typeof row.reworkStepId === 'string' ? row.reworkStepId : '',
+    reworkClosed: typeof row.reworkClosed === 'boolean' ? row.reworkClosed : false,
+    reworkClosedBy: typeof row.reworkClosedBy === 'string' ? row.reworkClosedBy : '',
+    legacy: typeof row.legacy === 'boolean' ? row.legacy : false,
+    revision: ROW_REVISION,
+  }))
   await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects], async () => {
     await Promise.all([
       db.furnaces.clear(),
@@ -334,9 +596,9 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.furnaces.bulkPut(snapshot.furnaces.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.batches.bulkPut(snapshot.batches.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.pieces.bulkPut(snapshot.pieces.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.steps.bulkPut(snapshot.steps.map((row) => ({ ...row, revision: ROW_REVISION })))
+    await db.steps.bulkPut(normalizedSteps)
     await db.anneals.bulkPut(snapshot.anneals.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.inspects.bulkPut(snapshot.inspects.map((row) => ({ ...row, revision: ROW_REVISION })))
+    await db.inspects.bulkPut(normalizedInspects)
   })
 }
 

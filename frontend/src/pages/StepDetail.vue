@@ -14,6 +14,8 @@ import { useStepProgress } from '@/hooks/useStepProgress'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
 import { STEP_NAME_OPTIONS, STEP_STATE_OPTIONS, type Step, type StepDraft, type StepName, type StepState } from '@/types/step'
+import type { OpenRework } from '@/hooks/useStepProgress'
+import { canAdvanceStep } from '@/utils/rework'
 import { buildStepCardText, copyText } from '@/utils/export'
 import { CRAFT_TEMP_RANGE, checkStepTemp, formatHours, totalAnnealHours } from '@/utils/thermal'
 
@@ -69,6 +71,23 @@ const tempCheck = computed(() =>
 )
 
 const currentStep = computed<Step | null>(() => steps.value.find((row) => row.state !== '已完成') ?? null)
+
+/** 该作品的未平返工（待接收 / 返工中 / 待复检 / 挂起） */
+const openReworks = computed<OpenRework[]>(() => progress.value.openReworks)
+
+/** 找到点中某道工序的返工记录，用于在工序卡片上显示返工状态与操作 */
+function reworkOfStep(step: Step): OpenRework | null {
+  return openReworks.value.find((row) => row.targetStep?.id === step.id) ?? null
+}
+
+/** 返工对账是否允许推进这道工序（仅控制按钮态，store 里还会再拦一次） */
+function canAdvance(step: Step): boolean {
+  return canAdvanceStep(step.pieceId, step.id, pieceStore.inspects, pieceStore.steps).allowed
+}
+
+function advanceBlockReason(step: Step): string {
+  return canAdvanceStep(step.pieceId, step.id, pieceStore.inspects, pieceStore.steps).reason
+}
 
 onMounted(() => {
   void furnaceStore.loadAll()
@@ -143,8 +162,24 @@ async function handleDelete(row: Step): Promise<void> {
 }
 
 async function handleAdvance(row: Step): Promise<void> {
-  await pieceStore.advanceStep(row.id)
-  ElMessage.success(pieceStore.lastMessage)
+  const ok = await pieceStore.advanceStep(row.id)
+  if (ok) ElMessage.success(pieceStore.lastMessage)
+  else ElMessage.warning(pieceStore.lastMessage)
+}
+
+/** 工序台领取返工：只重开被点中的这道，前面的工序记录保留不变 */
+async function handleAcceptRework(rework: OpenRework): Promise<void> {
+  const ok = await pieceStore.acceptRework(rework.inspect.id)
+  if (ok) ElMessage.success(pieceStore.lastMessage)
+  else ElMessage.warning(pieceStore.lastMessage)
+}
+
+/** 返工重做完成：该道推进到「已完成」，等待检验室复检 */
+async function handleFinishRework(rework: OpenRework): Promise<void> {
+  if (rework.targetStep === null) return
+  const ok = await pieceStore.finishReworkedStep(rework.targetStep.id)
+  if (ok) ElMessage.success(pieceStore.lastMessage)
+  else ElMessage.warning(pieceStore.lastMessage)
 }
 
 async function handleDrop(targetId: string): Promise<void> {
@@ -221,7 +256,53 @@ function goAnnealing(): void {
       </div>
 
       <el-alert
-        v-if="!progress.allDone"
+        v-if="progress.hasSuspendedRework"
+        type="error"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        title="返工对账未平，已挂起等检验室确认"
+        :description="openReworks.find((r) => r.phase === '挂起')?.reason"
+      />
+      <el-alert
+        v-for="rework in openReworks.filter((r) => r.phase !== '挂起')"
+        :key="rework.inspect.id"
+        :type="rework.phase === '待复检' ? 'success' : 'warning'"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        :title="`第 ${rework.inspect.reworkStepSeq} 道「${rework.targetStep?.name ?? '未知工序'}」返工：${rework.inspect.result}（${rework.phaseLabel}）`"
+      >
+        <template #default>
+          <div class="rework-line">
+            <span>{{ rework.inspect.defectNote }}</span>
+            <el-button
+              v-if="rework.phase === '待接收'"
+              type="warning"
+              size="small"
+              class="rework-btn"
+              @click="handleAcceptRework(rework)"
+            >
+              领取返工（只重开本道）
+            </el-button>
+            <el-button
+              v-if="rework.phase === '返工中'"
+              type="success"
+              size="small"
+              class="rework-btn"
+              @click="handleFinishRework(rework)"
+            >
+              重做完成，送复检
+            </el-button>
+            <span v-if="rework.phase === '待复检'" class="rework-hint">
+              该道已重做完成，请回到检验室登记合格复检关闭返工；在此之前不能进入退火排位。
+            </span>
+          </div>
+        </template>
+      </el-alert>
+
+      <el-alert
+        v-if="!progress.allDone && !progress.hasRework"
         type="warning"
         show-icon
         :closable="false"
@@ -230,7 +311,7 @@ function goAnnealing(): void {
         description="必须按序号依次把每一道工序推进到「已完成」，才允许分配退火窑位与曲线段。"
       />
       <el-alert
-        v-else
+        v-else-if="progress.allDone"
         type="success"
         show-icon
         :closable="false"
@@ -273,7 +354,12 @@ function goAnnealing(): void {
             v-for="(row, index) in steps"
             :key="row.id"
             class="step-item"
-            :class="{ 'is-drag-over': dragOverId === row.id, 'is-current': currentStep?.id === row.id }"
+            :class="{
+              'is-drag-over': dragOverId === row.id,
+              'is-current': currentStep?.id === row.id,
+              'is-rework': reworkOfStep(row) !== null && reworkOfStep(row)?.phase !== '挂起',
+              'is-suspended': reworkOfStep(row)?.phase === '挂起',
+            }"
             draggable="true"
             @dragstart="draggingId = row.id"
             @dragover.prevent="dragOverId = row.id"
@@ -292,6 +378,30 @@ function goAnnealing(): void {
                   {{ row.state }}
                 </el-tag>
                 <el-tag v-if="currentStep?.id === row.id" size="small" type="danger" effect="dark">当前道次</el-tag>
+                <el-tag
+                  v-if="reworkOfStep(row)?.phase === '待接收'"
+                  size="small"
+                  type="warning"
+                  effect="dark"
+                >返工待领取</el-tag>
+                <el-tag
+                  v-if="reworkOfStep(row)?.phase === '返工中'"
+                  size="small"
+                  type="warning"
+                  effect="plain"
+                >返工重做中</el-tag>
+                <el-tag
+                  v-if="reworkOfStep(row)?.phase === '待复检'"
+                  size="small"
+                  type="success"
+                  effect="dark"
+                >返工待复检</el-tag>
+                <el-tag
+                  v-if="reworkOfStep(row)?.phase === '挂起'"
+                  size="small"
+                  type="danger"
+                  effect="plain"
+                >返工挂起</el-tag>
               </div>
               <div class="step-sub">
                 {{ row.tempC }} ℃ · {{ row.durationMin }} 分钟 · 操作人 {{ row.operator }}
@@ -299,15 +409,34 @@ function goAnnealing(): void {
               </div>
             </div>
             <div class="step-actions">
-              <el-button
-                size="small"
-                type="primary"
-                plain
-                :disabled="row.state === '已完成'"
-                @click="handleAdvance(row)"
+              <template v-if="reworkOfStep(row)?.phase === '待接收'">
+                <el-button size="small" type="warning" @click="handleAcceptRework(reworkOfStep(row)!)">
+                  领取返工
+                </el-button>
+              </template>
+              <template v-else-if="reworkOfStep(row)?.phase === '返工中'">
+                <el-button size="small" type="success" @click="handleFinishRework(reworkOfStep(row)!)">
+                  重做完成
+                </el-button>
+              </template>
+              <el-tooltip
+                v-else
+                :disabled="pieceStore.inspects.length === 0 || canAdvance(row)"
+                :content="advanceBlockReason(row)"
+                placement="top"
               >
-                推进状态
-              </el-button>
+                <span>
+                  <el-button
+                    size="small"
+                    type="primary"
+                    plain
+                    :disabled="row.state === '已完成' || !canAdvance(row)"
+                    @click="handleAdvance(row)"
+                  >
+                    推进状态
+                  </el-button>
+                </span>
+              </el-tooltip>
               <el-button size="small" @click="openEdit(row)">编辑</el-button>
               <el-button size="small" type="danger" plain @click="handleDelete(row)">删除</el-button>
             </div>
@@ -428,6 +557,32 @@ function goAnnealing(): void {
 
 .step-item.is-current {
   background: #fffaf6;
+}
+
+.step-item.is-rework {
+  border-color: #d68910;
+  background: #fffaf0;
+}
+
+.step-item.is-suspended {
+  border-color: #c0392b;
+  background: #fdf3f2;
+}
+
+.rework-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.rework-btn {
+  margin-left: auto;
+}
+
+.rework-hint {
+  font-size: 12px;
+  color: #1e8449;
 }
 
 .step-seq {
